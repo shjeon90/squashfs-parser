@@ -344,7 +344,7 @@ class ExtendedDirectoryInode:
 @dataclass
 class Inode:
     inode_header: InodeHeader
-    inode_spec: Union[BasicSymlinkInode, BasicFileInode]
+    inode_entry: Union[BasicSymlinkInode, BasicFileInode]
 
 @dataclass
 class DirectoryHeader:
@@ -358,10 +358,10 @@ class DirectoryHeader:
 
     @classmethod
     def from_bytes(cls, data: bytes):
-        if len(data) < cls.struct_size():
-            raise ValueError(f'Not enough data: expected {cls.struct_size()} bytes, but got {len(data)} bytes.')
+        if len(data) < cls.size():
+            raise ValueError(f'Not enough data: expected {cls.size()} bytes, but got {len(data)} bytes.')
 
-        fields = struct.unpack(cls.struct_format(), data[:cls.struct_size()])
+        fields = struct.unpack(cls.struct_format(), data[:cls.size()])
         return cls(*fields)
 
     @classmethod
@@ -393,7 +393,16 @@ class DirectoryEntry:
 
     @property
     def size(self):
-        return struct.calcsize(self.struct_format()) + len(self.name) + 1
+        return struct.calcsize(self.struct_format()) + len(self.name)
+
+@dataclass
+class Directory:
+    dir_header: DirectoryHeader
+    dir_entries: List[DirectoryEntry]
+
+    @property
+    def size(self):
+        return self.dir_header.size() + sum(entry.size for entry in self.dir_entries)
 
 class SquashFsImage:
     def __init__(self, path_img: str):
@@ -432,7 +441,7 @@ class SquashFsImage:
         else:
             raise ValueError(f'Unknown compression ID: {self.superblock.compression_id}')
 
-    def __parse_metadata_block(self, f):
+    def __decompress_metadata_block(self, f):
         header = struct.unpack('<H', f.read(2))[0]
         data_size = header & 0x7FFF
 
@@ -472,7 +481,7 @@ class SquashFsImage:
         
         while len(inodes) < self.superblock.inode_cnt:
             try:
-                payload = buf + self.__parse_metadata_block(f)
+                payload = buf + self.__decompress_metadata_block(f)
 
                 offset = 0
                 while offset + InodeHeader.size() <= len(payload):
@@ -481,19 +490,19 @@ class SquashFsImage:
                     offset += InodeHeader.size()
 
                     if inode_header.inode_type == 1:
-                        inode = self.__parse_basic_directory_inode(payload[offset:])
+                        inode_entry = self.__parse_basic_directory_inode(payload[offset:])
                     elif inode_header.inode_type == 2:
-                        inode = self.__parse_basic_file_inode(payload[offset:])
+                        inode_entry = self.__parse_basic_file_inode(payload[offset:])
                     elif inode_header.inode_type == 3:
-                        inode = self.__parse_basic_symlink_inode(payload[offset:])
+                        inode_entry = self.__parse_basic_symlink_inode(payload[offset:])
                     elif inode_header.inode_type == 8:
-                        inode = self.__parse_extended_directory_inode(payload[offset:])
+                        inode_entry = self.__parse_extended_directory_inode(payload[offset:])
                     else:
                         raise ValueError(f'Unknown inode type: {inode_header.inode_type}')
 
-                    offset += inode.size
+                    offset += inode_entry.size
+                    inode = Inode(inode_header, inode_entry)
                     inodes.append(inode)
-                    i += 1
 
                 buf = payload[offset:]
             except struct.error as e:
@@ -513,7 +522,48 @@ class SquashFsImage:
             raise ValueError('Parsing uncompressed inode table is not supported.')
 
     def _parse_directory_table(self, f):
-        f.seek(self.superblock.dir_tab_start)
+        dir_inodes = [inode for inode in self.inode_table if isinstance(inode.inode_entry, (BasicDirectoryInode, ExtendedDirectoryInode))]
+        dir_table = {}
+        
+        for dir_inode in dir_inodes:
+            dir_items = []
+
+            if dir_inode.inode_entry.file_size - 3 == 0: 
+                dir_table[dir_inode.inode_header.inode_number] = dir_items
+                continue
+
+            f.seek(self.superblock.dir_tab_start + dir_inode.inode_entry.dir_block_start)
+
+            payload = b''
+            while True:
+                payload += self.__decompress_metadata_block(f)
+                offset = dir_inode.inode_entry.block_offset
+                file_size = dir_inode.inode_entry.file_size
+
+                if offset + file_size <= len(payload): break
+
+            
+            sz = 0
+            while True:
+                dir_header = DirectoryHeader.from_bytes(payload[offset:offset+DirectoryHeader.size()])
+                offset += DirectoryHeader.size()
+
+                dir_entries = []
+                for _ in range(dir_header.count + 1):
+                    dir_entry = DirectoryEntry.from_bytes(payload[offset:])
+                    offset += dir_entry.size
+                    dir_entries.append(dir_entry)
+
+                dir_item = Directory(dir_header, dir_entries)
+                dir_items.append(dir_item)
+                sz += dir_item.size
+
+                if sz + 3 == dir_inode.inode_entry.file_size: break
+            
+            dir_table[dir_inode.inode_header.inode_number] = dir_items
+
+        self.dir_table = dir_table
+
 
     def parse(self):
         with open(self.path_img, 'rb') as f:
