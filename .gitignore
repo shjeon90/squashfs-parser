@@ -1,0 +1,3 @@
+# Ignore extracted output files and build metadata
+output-root/
+squashfs_parser.egg-info/
