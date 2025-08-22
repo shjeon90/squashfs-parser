@@ -1,0 +1,7 @@
+setup.py
+squashfs/__init__.py
+squashfs/blocks.py
+squashfs_parser.egg-info/PKG-INFO
+squashfs_parser.egg-info/SOURCES.txt
+squashfs_parser.egg-info/dependency_links.txt
+squashfs_parser.egg-info/top_level.txt
