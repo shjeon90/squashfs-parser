@@ -1,5 +1,6 @@
 import struct
 import math
+import os
 import zlib
 import lzma
 import lz4.frame as lz4f
@@ -17,6 +18,12 @@ COMPRESSION_ALGOS = {
     6: 'ZSTD'
 }
 
+XATTR_KEY_NAME_PREFIX = {
+    0: 'user',
+    1: 'trusted',
+    2: 'security'
+}
+
 FLAGS_UNCOMPRESSED_INODES = 0x0001
 FLAGS_UNCOMPRESSED_DATA = 0x0002
 FLAGS_CHECK = 0x0004
@@ -29,6 +36,11 @@ FLAGS_UNCOMPRESSED_XATTRS = 0x0100
 FLAGS_NO_XATTRS = 0x0200
 FLAGS_COMPRESSOR_OPTIONS = 0x0400
 FLAGS_UNCOMPRESSED_IDS = 0x0800
+
+INODE_TYPE_BASIC_DIRECTORY = 1
+INODE_TYPE_BASIC_FILE = 2
+INODE_TYPE_BASIC_SYMLINK = 3
+INODE_TYPE_EXTENDED_DIRECTORY = 8
 
 @dataclass
 class SquashFsSuperblock:
@@ -345,7 +357,7 @@ class ExtendedDirectoryInode:
 @dataclass
 class Inode:
     inode_header: InodeHeader
-    inode_entry: Union[BasicSymlinkInode, BasicFileInode]
+    inode_entry: Union[BasicSymlinkInode, BasicFileInode, BasicDirectoryInode, ExtendedDirectoryInode]
 
 @dataclass
 class DirectoryHeader:
@@ -427,14 +439,111 @@ class FragmentEntry:
         fields = struct.unpack(cls.struct_format(), data[:cls.size()])
         return cls(*fields)
 
+@dataclass
+class XattrKey:
+    key_type: int
+    name_size: int
+    name: str
+
+    @classmethod
+    def struct_format(cls):
+        return '<HH'
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        base_size = struct.calcsize(cls.struct_format())
+        key_type, name_size = struct.unpack(cls.struct_format(), data[:base_size])
+        
+        name_byte = data[base_size:base_size + name_size]
+        name = name_byte.decode('utf-8')
+
+        return cls(key_type, name_size, name)
+
+    @property
+    def size(self):
+        return struct.calcsize(self.struct_format()) + len(self.name)
+
+@dataclass
+class XattrValue:
+    value_size: int
+    value: bytes
+
+    @classmethod
+    def struct_format(cls):
+        return '<I'
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        base_size = struct.calcsize(cls.struct_format())
+        value_size = struct.unpack(cls.struct_format()[0], data[:base_size])
+
+        value = data[base_size:base_size + value_size]
+        return cls(value_size, value)
+
+    @property
+    def size(self):
+        return struct.calcsize(self.struct_format()) + len(self.value)
+
+@dataclass
+class XattrLookUpTable:
+    xattr_ref: int
+    count: int
+    size: int
+
+    @classmethod
+    def struct_format(cls):
+        return '<QII'
+
+    @classmethod
+    def size(cls):
+        return struct.calcsize(cls.struct_format())
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        if len(data) < cls.size():
+            raise ValueError(f'Not enough data: expected {cls.size()} bytes, but got {len(data)} bytes.')
+
+        fields = struct.unpack(cls.struct_format(), data[:cls.size()])
+        return cls(*fields)
+
+@dataclass
+class XattrIdTable:
+    xattr_table_start: int
+    xattr_ids: int
+    _unused: int
+    table: List[int]
+
+    @classmethod
+    def struct_format(cls):
+        return '<QII'
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        base_size = struct.calcsize(cls.struct_format())
+        xattr_table_start, xattr_ids, _unused = struct.unpack(cls.struct_format(), data[:base_size])
+
+        loc_count = math.ceil(xattr_ids / 512) if xattr_ids > 0 else 0
+        table = list(struct.unpack(f'<{loc_count}Q', data[base_size:base_size + loc_count * 8]))
+
+        return cls(xattr_table_start, xattr_ids, _unused, table)
+
+    @property
+    def size(self):
+        return struct.calcsize(self.struct_format()) + len(self.table) * 8
+
 class SquashFsImage:
-    def __init__(self, path_img: str):
+    def __init__(self, path_img: str, path_out: str):
         self.path_img = path_img
+        self.path_out = path_out
         self.superblock = None
         self.compression_options = None
         self.inode_table = None
+        self.inode_dict = {}
         self.dir_table = None
         self.frag_table = None
+        self.export_table = None
+        self.id_table = None
+        self.xattr_table = None
 
     def _parse_compression_options(self, f):
         if self.superblock.flags & 0x0400:
@@ -513,13 +622,13 @@ class SquashFsImage:
                     
                     offset += InodeHeader.size()
 
-                    if inode_header.inode_type == 1:
+                    if inode_header.inode_type == INODE_TYPE_BASIC_DIRECTORY:
                         inode_entry = self.__parse_basic_directory_inode(payload[offset:])
-                    elif inode_header.inode_type == 2:
+                    elif inode_header.inode_type == INODE_TYPE_BASIC_FILE:
                         inode_entry = self.__parse_basic_file_inode(payload[offset:])
-                    elif inode_header.inode_type == 3:
+                    elif inode_header.inode_type == INODE_TYPE_BASIC_SYMLINK:
                         inode_entry = self.__parse_basic_symlink_inode(payload[offset:])
-                    elif inode_header.inode_type == 8:
+                    elif inode_header.inode_type == INODE_TYPE_EXTENDED_DIRECTORY:
                         inode_entry = self.__parse_extended_directory_inode(payload[offset:])
                     else:
                         raise ValueError(f'Unknown inode type: {inode_header.inode_type}')
@@ -542,6 +651,8 @@ class SquashFsImage:
 
         if self.superblock.flags & FLAGS_UNCOMPRESSED_INODES == 0:  # compressed inode table
             self.inode_table = self.__parse_compressed_inode_table(f)
+            for inode in self.inode_table:
+                self.inode_dict[inode.inode_header.inode_number] = inode
         else:  # uncompressed inode table
             raise ValueError('Parsing uncompressed inode table is not supported.')
 
@@ -628,6 +739,166 @@ class SquashFsImage:
                 id_table.append(id)
         self.id_table = id_table
 
+    def _parse_export_table(self, f):   # fragment/id table must be implemented like this.
+        is_exportable = (self.superblock.flags & FLAGS_EXPORTABLE) != 0
+
+        export_table = []
+
+        if is_exportable:
+            f.seek(self.superblock.export_tab_start)
+            
+            cnt_export = math.ceil(self.superblock.inode_cnt / 1024)
+            metadata_locs = [struct.unpack('<Q', f.read(8))[0] for _ in range(cnt_export)]
+            remain = self.superblock.inode_cnt
+
+            for mloc in metadata_locs:
+                f.seek(mloc)
+
+                payload = self.__decompress_metadata_block(f)
+                take = min(1024, remain)
+                offset = 0
+                for _ in range(take):
+                    ref = struct.unpack('<Q', payload[offset:offset + 8])[0]
+                    export_table.append(ref)
+                    offset += 8
+                remain -= take
+
+        self.export_table = export_table
+
+    def _parse_xattr_table(self, f):
+        has_xattrs = self.superblock.flags & FLAGS_NO_XATTRS == 0
+
+        xattr_table = []
+        if has_xattrs:
+            raise ValueError('Parsing xattr table is not supported.')
+        
+        self.xattr_table = xattr_table
+    
+    def __find_root_inode(self):
+        dir_set = set(self.dir_table.keys())
+        child_set = set()
+
+        for parent_no, dir_items in self.dir_table.items():
+            for d in dir_items:
+                base = d.dir_header.inode_number
+
+                for e in d.dir_entries:
+                    name = e.name
+
+                    if name in ('.', '..'): continue
+
+                    child_set.add(base + e.inode_offset)
+
+        roots = list(dir_set - child_set)
+        if len(roots) != 1:
+            raise RuntimeError(f'The number of root candidates is {len(roots)}: {roots}')
+        return self.inode_dict[roots[0]]
+
+    def __find_children(self, inode):
+        children = []
+        for d in self.dir_table[inode.inode_header.inode_number]:
+            base_ino = d.dir_header.inode_number
+            
+            for e in d.dir_entries:
+                name = e.name
+                if name in ('.', '..'): continue
+
+                child_ino = base_ino + e.inode_offset
+                
+                children.append((name, self.inode_dict[child_ino]))
+
+        return children
+
+    def __extract_directory(self, inode, out_path: str):
+        os.makedirs(out_path, exist_ok=True)
+        os.chmod(out_path, inode.inode_header.permissions & 0o7777)
+
+        uid = self.id_table[inode.inode_header.uid]
+        gid = self.id_table[inode.inode_header.gid]
+
+        os.chown(out_path, uid, gid)
+
+    def __extract_basic_file(self, f, inode, out_path: str):
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+        with open(out_path, 'wb') as file:
+            written = 0
+            pos = inode.inode_entry.blocks_start
+
+            for sz in inode.inode_entry.block_sizes:
+                remain = inode.inode_entry.file_size - written
+                if remain <= 0: break
+
+                is_compressed = sz & 0x80000000 == 0
+                sz = sz & 0x7FFFFFFF
+                
+                if is_compressed:
+                    f.seek(pos)
+                    data = f.read(sz)
+                    
+                    payload = self.__decompress_block(data)
+                    pos += sz
+
+                    if len(payload) > remain:
+                        payload = payload[:remain]
+
+                    file.write(payload)
+                    written += len(payload)
+
+                else:
+                    raise ValueError('Unsupported block format.')
+
+            if written < inode.inode_entry.file_size and inode.inode_entry.fragment_block_index != 0xFFFFFFFF:
+                fragment = self.frag_table[inode.inode_entry.fragment_block_index]
+                f.seek(fragment.start)
+
+                data = f.read(fragment._size)
+                try: payload = self.__decompress_block(data)
+                except: payload = data
+
+                remain = inode.inode_entry.file_size - written
+                payload = payload[inode.inode_entry.block_offset:inode.inode_entry.block_offset + remain]
+                file.write(payload)
+
+            os.chmod(out_path, inode.inode_header.permissions & 0o7777)
+
+            uid = self.id_table[inode.inode_header.uid]
+            gid = self.id_table[inode.inode_header.gid]
+
+            os.chown(out_path, uid, gid)
+
+    def __extract_symlink(self, inode, out_path: str):
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        target = inode.inode_entry.target_path
+
+        if os.path.lexists(out_path):
+            os.remove(out_path)
+        os.symlink(target, out_path)
+
+    def _parse_datablocks_fragments(self, f):
+        root_inode = self.__find_root_inode()
+
+        def walk(cur_inode, cur_out):
+            inode_ty = cur_inode.inode_header.inode_type
+            
+            if inode_ty in (INODE_TYPE_BASIC_DIRECTORY, INODE_TYPE_EXTENDED_DIRECTORY):
+                self.__extract_directory(cur_inode, cur_out)
+
+                children = self.__find_children(cur_inode)
+                for name, child_inode in children:
+                    name = name.replace('/', '_')
+                    walk(child_inode, os.path.join(cur_out, name))
+
+            elif inode_ty in (INODE_TYPE_BASIC_FILE, ):
+                self.__extract_basic_file(f, cur_inode, cur_out)
+            elif inode_ty in (INODE_TYPE_BASIC_SYMLINK, ):
+                self.__extract_symlink(cur_inode, cur_out)
+            else:
+                raise ValueError(f'Unknown inode type: {inode_ty}')
+
+        walk(root_inode, self.path_out)
+
+
     def parse(self):
         with open(self.path_img, 'rb') as f:
             data_superblock = f.read(SquashFsSuperblock.size())
@@ -645,8 +916,19 @@ class SquashFsImage:
             # parsing fragment table
             self._parse_fragment_table(f)
 
+            # parsing export table
+            self._parse_export_table(f)
+
             # parsing uid/gid table
             self._parse_id_table(f)
+
+            # parsing xattr table
+            self._parse_xattr_table(f)
+
+            # parsing datablocks and fragments
+            self._parse_datablocks_fragments(f)
+
+            print(f'Parsing {self.path_img} completed successfully.')
 
     def print(self):
         print(f'Superblock: {self.superblock}')
