@@ -1,4 +1,5 @@
 import struct
+import math
 import zlib
 import lzma
 import lz4.frame as lz4f
@@ -404,6 +405,28 @@ class Directory:
     def size(self):
         return self.dir_header.size() + sum(entry.size for entry in self.dir_entries)
 
+@dataclass
+class FragmentEntry:
+    start: int
+    _size: int
+    _unused: int
+
+    @classmethod
+    def struct_format(cls):
+        return '<QII'
+    
+    @classmethod
+    def size(cls):
+        return struct.calcsize(cls.struct_format())
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        if len(data) < cls.size():
+            raise ValueError(f'Not enough data: expected {cls.size()} bytes, but got {len(data)} bytes.')
+
+        fields = struct.unpack(cls.struct_format(), data[:cls.size()])
+        return cls(*fields)
+
 class SquashFsImage:
     def __init__(self, path_img: str):
         self.path_img = path_img
@@ -411,6 +434,7 @@ class SquashFsImage:
         self.compression_options = None
         self.inode_table = None
         self.dir_table = None
+        self.frag_table = None
 
     def _parse_compression_options(self, f):
         if self.superblock.flags & 0x0400:
@@ -541,7 +565,6 @@ class SquashFsImage:
                 file_size = dir_inode.inode_entry.file_size
 
                 if offset + file_size <= len(payload): break
-
             
             sz = 0
             while True:
@@ -564,6 +587,46 @@ class SquashFsImage:
 
         self.dir_table = dir_table
 
+    def _parse_fragment_table(self, f): # incomplete implementation
+        is_frag = self.superblock.flags & FLAGS_NO_FRAGMENTS == 0
+
+        if is_frag:
+            f.seek(self.superblock.fragment_tab_start)
+            cnt_metadatablock = math.ceil(self.superblock.fragment_entry_cnt / 512)
+            metadata_locs = [struct.unpack('<Q', f.read(8))[0] for _ in range(cnt_metadatablock)]
+
+            frag_table = []
+            for mloc in metadata_locs:
+                f.seek(mloc)
+
+                payload = self.__decompress_metadata_block(f)
+                offset = 0
+                for _ in range(self.superblock.fragment_entry_cnt):
+                    frag_entry = FragmentEntry.from_bytes(payload[offset:offset + FragmentEntry.size()])
+                    offset += FragmentEntry.size()
+                    frag_table.append(frag_entry)
+                
+            self.frag_table = frag_table
+        else:
+            raise ValueError('Parsing fragment table is not supported.')
+
+    def _parse_id_table(self, f):   # incomplete implementation
+        f.seek(self.superblock.id_tab_start)
+
+        cnt_ids = math.ceil(self.superblock.id_count / 2048)
+        metadata_locs = [struct.unpack('<Q', f.read(8))[0] for _ in range(cnt_ids)]
+        
+        id_table = []
+        for mloc in metadata_locs:
+            f.seek(mloc)
+
+            payload = self.__decompress_metadata_block(f)
+            offset = 0
+            for _ in range(self.superblock.id_count):
+                id = struct.unpack('<I', payload[offset:offset+4])[0]
+                offset += 4
+                id_table.append(id)
+        self.id_table = id_table
 
     def parse(self):
         with open(self.path_img, 'rb') as f:
@@ -579,10 +642,16 @@ class SquashFsImage:
             # parsing directory table
             self._parse_directory_table(f)
 
+            # parsing fragment table
+            self._parse_fragment_table(f)
+
+            # parsing uid/gid table
+            self._parse_id_table(f)
 
     def print(self):
         print(f'Superblock: {self.superblock}')
-        if self.compression_options:
-            print(f'Compression Options: {self.compression_options}')
-        else:
-            print('No compression options available.')
+
+        # if self.compression_options:
+        #     print(f'Compression Options: {self.compression_options}')
+        # else:
+        #     print('No compression options available.')
