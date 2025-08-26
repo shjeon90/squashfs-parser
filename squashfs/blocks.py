@@ -698,11 +698,6 @@ class SquashFsImage:
 
         self.dir_table = dir_table
 
-        for no, d in dir_table.items():
-            if len(d) > 1:
-                print(no, d)
-                exit(0)
-
     def _parse_fragment_table(self, f): # incomplete implementation
         is_frag = self.superblock.flags & FLAGS_NO_FRAGMENTS == 0
 
