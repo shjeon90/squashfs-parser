@@ -1,4 +1,4 @@
-import argparser
+import argparse
 from squashfs.blocks import SquashFsImage
 
 def parse_args():
